@@ -1,6 +1,6 @@
 # Problem 2 – Highly Available Trading System Architecture
 
-Design of a resilient, scalable, cost-effective trading platform inspired by core Binance-style features, with emphasis on availability and scalability.
+Design of a resilient, scalable, cost-effective trading platform inspired by core Binance-style features, with emphasis on availability, **correctness**, and scalability.
 
 ---
 
@@ -12,252 +12,470 @@ Design of a resilient, scalable, cost-effective trading platform inspired by cor
 | **Throughput** | **500 requests per second** (aggregate API traffic) |
 | **Latency** | **p99 response time < 100 ms** (API path, region-local clients) |
 
-The rest of this document is written to satisfy these constraints. Non-functional paths (e.g. async analytics, batch exports) are excluded from the 100 ms p99 unless stated.
+Non-functional paths (e.g. async analytics, batch exports) are excluded from the 100 ms p99 unless stated. **Order submission / matching** has stricter **business** SLOs documented in §8.
 
 ---
 
 ## 1. Features in Scope
 
 - **Order management** – Place/cancel orders (limit, market), order book
-- **Matching engine** – Central order matching with strong consistency and audit trail
+- **Matching engine** – Central order matching with **defined consistency** and **immutable audit**
 - **Market data** – Real-time ticker, depth, and trades via WebSocket
 - **Account & balances** – Wallet balances, position tracking (simplified)
 - **REST + WebSocket APIs** – Public (market data) and private (orders, account) with auth
 
-Out of scope for this design: full custody, fiat rails, complex margin/derivatives, KYC pipelines.
+Out of scope: full custody, fiat rails, complex margin/derivatives, KYC pipelines.
 
 ---
 
-## 2. Overview Diagram
+## 2. Architecture overview — diagrams and planes
+
+The deliverable asks for an **overview of services and roles**. Below: **control vs data plane**, **multi-AZ**, **read vs write paths**, and **sync vs async** — visible at a glance.
+
+### 2.1 Control plane vs data plane
+
+| Plane | Responsibility | Typical AWS components |
+|-------|----------------|-------------------------|
+| **Control plane** | **Configuration and lifecycle**: deploys, autoscaling policies, secrets rotation, feature flags, **matching-engine leader election config** (not the hot path per order). | **ECS/EKS control plane**, **Systems Manager Parameter Store**, **Secrets Manager**, **CodePipeline/CodeDeploy**, optional **etcd** (if self-managed consensus). |
+| **Data plane** | **Per-request / per-event** work: HTTP/WebSocket, **matching**, **persistence**, **market-data fan-out**. Everything that touches customer money or orders in real time. | **ALB**, **ECS tasks**, **matching-engine processes**, **Aurora**, **ElastiCache**, **MSK**, **X-Ray** |
+
+**Rule:** Trading correctness and latency SLOs apply to the **data plane**. Control-plane outages may block deploys but must not silently corrupt order state.
+
+### 2.2 Diagram A — Multi-AZ data plane (VPC, synchronous vs asynchronous hints)
+
+```mermaid
+flowchart LR
+    subgraph Internet
+        Clients[Clients]
+    end
+
+    subgraph Edge
+        R53[Route 53]
+        CF[CloudFront]
+        WAF[WAF]
+        ALB[ALB]
+    end
+
+    subgraph AZ_A["AZ-a"]
+        ECS_A[ECS API / WS]
+        ME_L[Matching engine LEADER]
+        REDIS_A[ElastiCache replica]
+    end
+
+    subgraph AZ_B["AZ-b"]
+        ECS_B[ECS API / WS]
+        ME_S[Matching engine STANDBY]
+        REDIS_B[ElastiCache replica]
+    end
+
+    subgraph DataRegion["Regional / multi-AZ data stores"]
+        AUR[(Aurora Primary + replicas)]
+        MSK[[MSK cluster]]
+        S3[(S3 audit / cold)]
+    end
+
+    Clients --> R53 --> CF --> WAF --> ALB
+    ALB --> ECS_A
+    ALB --> ECS_B
+    ECS_A --> ME_L
+    ECS_B --> ME_S
+    ME_L --> AUR
+    ME_L --> MSK
+    ME_L -.->|hot cache snapshot| REDIS_A
+    ME_S -.->|follower / warm| REDIS_B
+    MSK -.->|async: market-data consumers| ECS_A
+```
+
+**Legend (not all edges are HTTP):**
+
+- **Solid user path:** Client → edge → **ECS** → **matching leader** → **Aurora** (durable commit) and **MSK** (async publish — see §2.3).
+- **Dashed:** Cache replicas; async fan-out. **ElastiCache** holds **working set / snapshots**, not the **source of truth** for recovery (§3).
+
+### 2.3 Diagram B — Write path vs read path
+
+| Path | Purpose | Synchronous steps (typical) | Async (does not block HTTP ack for ack-eligible APIs) |
+|------|-----------|------------------------------|--------------------------------------------------------|
+| **Write** | Submit / cancel order, **match** | ALB → ECS → **idempotency check (Redis)** → **matching engine** → **append audit + order state to Aurora** → **publish match event to MSK** | Downstream: WebSocket consumers, analytics, **MSK** replication |
+| **Read** | Balances, public book, history | ALB → ECS → **Redis** (ticker, cached book) or **Aurora replica** (history) | — |
 
 ```mermaid
 flowchart TB
-    subgraph Clients
-        Web[Web / Mobile]
-        API_Users[API Clients]
+    subgraph Write["WRITE PATH — latency-sensitive; must be correct"]
+        W1[POST /orders] --> W2[Idempotency Redis]
+        W2 --> W3[Matching engine leader]
+        W3 --> W4["Aurora: WAL-equivalent order + match records"]
+        W3 --> W5[MSK produce: MatchEvent with seq]
+        W5 -.->|async| W6[WS + consumers]
     end
 
-    subgraph Global["Route 53 & global edge (outside VPC)"]
-        R53[Route 53]
-        CDN[CloudFront]
-        WAF[AWS WAF + Shield]
+    subgraph Read["READ PATH — hot reads (p99 SLO)"]
+        R1[GET /book /ticker] --> R2[Redis snapshot]
+        R3[GET /history] --> R4[Aurora replica]
     end
-
-    subgraph VPC["VPC — isolated private network (multi-AZ)"]
-        subgraph Public["Public subnets"]
-            ALB[Application Load Balancer]
-            IGW[Internet Gateway]
-            NAT[NAT Gateway]
-        end
-        subgraph Private["Private subnets — internal traffic only"]
-            subgraph API["API Tier (Stateless)"]
-                REST[REST API Servers]
-                WS[WebSocket Servers]
-            end
-            subgraph Core["Core Trading"]
-                ME[Matching Engine Cluster]
-                OB[(Order Book Store)]
-            end
-            subgraph Data["Data & Messaging"]
-                MQ[Message Queue]
-                Cache[(Distributed Cache)]
-                DB[(Primary DB)]
-                Replica[(Read Replicas)]
-                TS[(Time-Series / Ticks)]
-            end
-        end
-    end
-
-    Web --> R53
-    API_Users --> R53
-    R53 --> CDN
-    R53 --> WAF
-    CDN --> ALB
-    WAF --> ALB
-    ALB --> REST
-    ALB --> WS
-    REST --> ME
-    REST --> Cache
-    REST --> DB
-    REST --> Replica
-    WS --> MQ
-    WS --> Cache
-    ME --> OB
-    ME --> MQ
-    ME --> DB
-    MQ --> WS
-    MQ --> TS
 ```
 
+**MSK publish:** For **HTTP 200** semantics, the design **commits durable state in Aurora first**, then produces to MSK (or uses **outbox pattern** so MSK failure does not lose events — see §3). **p99 < 100 ms** assumes the **synchronous** segment stays within budget (§6).
 
-*Traffic notes:* **North–south** (clients -> app): DNS resolves to CloudFront and/or ALB; HTTPS hits **ALB** in **public subnets** (routed via **Internet Gateway**). **East–west** (app ↔ data): **REST/WS ↔ ElastiCache, RDS, MSK** stays **inside the VPC** on private IPs, governed by **security groups**. **Outbound** from **private subnets** (e.g. ECS image pulls, patches) uses the **NAT Gateway** in **public subnets** (default route), or **VPC endpoints** to AWS APIs where possible to reduce NAT use and keep traffic on the AWS backbone.
+### 2.4 Diagram C — Where each service sits (role summary)
 
-**Role of each area:**
-
-| Layer | Role |
-|-------|------|
-| **Edge (global)** | **Route 53** for public DNS (hostnames -> CloudFront / ALB); **CloudFront** for static content and optional API caching; **WAF** and DDoS protection. |
-| **VPC** | **Isolated network** (CIDR) spanning **multiple AZs**: **public subnets** host **ALB** + **Internet Gateway** for inbound HTTPS from the Internet; **private subnets** host ECS workloads, matching engine, and data stores so they are **not directly reachable from the Internet**. **Internal traffic** (API -> Redis/Postgres/MSK) stays on **private AWS networking** with **security groups** (and optional NACLs). **NAT Gateway** (or **VPC endpoints**) provides **controlled outbound** from private subnets. |
-| **API tier** | Stateless REST (orders, account, public market endpoints) and WebSocket (real-time market data and order updates). |
-| **Core** | Matching engine: consumes orders, matches against order book, produces trades and book updates; order book stored for consistency and recovery. |
-| **Data** | Message queue for events (trades, book updates); cache for hot data (order book snapshot, tickers); primary DB for orders/accounts/audit; read replicas for reads; time-series for ticks/analytics. |
+| Service | Role in one line |
+|---------|------------------|
+| **Route 53 / CloudFront / WAF / ALB** | DNS, edge cache, L7 security, TLS, route to ECS. |
+| **ECS Fargate** | Stateless API + WebSocket **front**; no order book truth. |
+| **Matching engine (EC2 or ECS)** | **Single-writer** per symbol shard; **leader** + **standby**; **Raft/etcd** or external coordination (§3). |
+| **Aurora PostgreSQL** | **System of record**: orders, balances (or reservations), **append-only audit** tables, **outbox** for MSK. |
+| **ElastiCache Redis** | Idempotency keys, **balance reservations**, **hot book snapshot**, rate limits — **not** durable recovery source. |
+| **MSK (Kafka)** | **Sequenced** market-data and trade events; replay and gap detection. |
+| **S3** | Long-retention **immutable** audit exports, compliance. |
+| **X-Ray + CloudWatch** | **Distributed trace** of write path; metrics; **business SLO** dashboards (§8). |
 
 ---
 
-## 3. AWS Services, Rationale, and Alternatives *within AWS*
+## 3. Matching engine — consistency, persistence, and failover
+
+This is the **core** of the system; web-tier HA is insufficient without a precise **matching** model.
+
+### 3.1 Consistency model and the “at-most-once fill” problem
+
+**Requirement:** A match (fill) must be **at-most-once** from the client’s perspective: **never double-execute** the same fill; **never lose** an accepted order without explicit **rejection** or **durably recorded** state so the client can reconcile.
+
+| Scenario | Desired behavior |
+|----------|------------------|
+| Leader **accepts** an order in memory, **crashes** before **durable commit** | Client may **retry with same idempotency key** (§4); engine **must not** double-match. **Recovery:** uncommitted in-memory state is **lost**; client sees **timeout** and retries — idempotency dedupes **submission**, **matching** replays from **durable intent** in Aurora. |
+| Leader **commits** match to Aurora, **crashes** before MSK publish | **Outbox pattern:** row in `outbox` table in **same transaction** as match; **relay** publishes to MSK; no lost fills. |
+| Network **partition** between AZs | See **split-brain** (§7.3). |
+
+**Implementation sketch:**
+
+1. **Order intent** is **inserted** into Aurora (`orders` with status `PENDING`) in a **transaction** **before** the in-memory book is updated (or in the same critical section with **two-phase** semantics).
+2. **Matching** updates **same transaction**: `orders` → `FILLED`, `fills` insert, **balances / reservations** updated.
+3. **Commit** to Aurora = **durable** decision; only then is the match **irreversible** for billing.
+
+**Redis is not the durability boundary.** If Redis dies, **replay** from Aurora + **rebuild** in-memory book from **event log** or **snapshot + delta** (§3.2).
+
+### 3.2 How the order book is persisted
+
+| Layer | What it stores | Durability |
+|-------|----------------|------------|
+| **Aurora (primary)** | **Append-only** `order_events` (or equivalent), **current order state**, **fills**, **balance reservations**, **outbox rows** | **Durable**; Multi-AZ sync per Aurora config |
+| **Optional: MSK as immutable log** | **Match events** for **external** consumers; **not** required for engine recovery if Aurora is source of truth | Replicated |
+| **ElastiCache** | **Hot order book** snapshot, **ranked queues** per symbol for speed | **Ephemeral**; rebuilt after failover |
+
+**Recovery path if Redis fails before DB write completes:**
+
+- **Invariant:** No fill is **acknowledged to the client** until **Aurora commit** succeeds. If the process dies **after** commit but **before** Redis update, **new leader** loads state from Aurora and **rehydrates** Redis from **DB + optional event replay**.
+- If the process dies **before** commit, the **order** may be `PENDING` or absent — client **idempotency retry** converges.
+
+**WAL terminology:** Aurora’s **storage layer** provides **redo**; **application-level** “WAL” is the **append-only order_events + outbox** in PostgreSQL (or **Kinesis** as **ingest** in larger systems — here Aurora suffices at 500 RPS).
+
+### 3.3 Leader, standby, and concrete consensus
+
+**Options (AWS-grounded):**
+
+| Approach | How it works | Operational reality |
+|----------|--------------|---------------------|
+| **Dedicated EC2 + embedded Raft** (e.g. **Hashicorp Raft** / **etcd** as separate cluster) | **3+ nodes** for quorum; **leader** runs matcher | **etcd is not a managed AWS service**; typical patterns: **self-managed etcd on EC2** (3-node ASG across AZs), or **EKS** (Kubernetes uses etcd for the control plane — you don’t run application Raft inside it unless you deploy **etcd as workloads**). For matching-only, **small EC2 cluster + etcd** is the clearest **ops** story. |
+| **ECS + external lock** | **Single writer** via **DynamoDB conditional writes** / **RDS advisory locks** | Simpler but **lock TTL** and **fencing** must be bulletproof — often **weaker** than Raft for **hard** partition tolerance |
+| **Single active + Aurora row lease** | **Leader lease** with **expiry** and **fencing token** in DB | Works at moderate scale; **must** fence stale leaders |
+
+**Recommendation for this design:** **Matching engine on EC2 (or ECS with stable ENIs)** in **3-node** group across AZs, using **etcd** (self-managed on EC2 or **EKS** if you already run K8s) **or** **AWS-managed alternative**: run **only** the coordination on **small EC2 ASG** with **etcd**, **not** “Raft in a sentence.”
+
+**Raft named =** typically **etcd** (Go Raft implementation) **or** Consul; **document which** and **how many** nodes, **which AZs**.
+
+### 3.4 Failover RTO / RPO
+
+| Metric | Target (example — tune per product) | Notes |
+|--------|-------------------------------------|--------|
+| **RPO** | **~0** for committed matches (Aurora sync) | Uncommitted in-flight may be **lost** from client POV → **idempotency** |
+| **RTO** | **Seconds to low tens of seconds** | **Leader election** (etcd) + **standby** catch-up + **resume** ingestion; **not** instant — **document** e.g. **15–45 s** worst case so stakeholders know **trading may halt** that window |
+| **During RTO** | **Reject or queue** new orders at API | **503** with `Retry-After` or **read-only** flag (§7.4) |
+
+**30 seconds of halted matching** is a **P0** for a live exchange; mitigation = **symbol sharding** (only **affected** symbols down), **multi-region** (out of scope for minimal design), **transparent** status page + **runbook**.
+
+---
+
+## 4. Financial-domain correctness
+
+Requirements that **generic** web stacks often omit.
+
+### 4.1 Idempotency keys (order submission)
+
+- Clients send **`Idempotency-Key`** (or body field) on **POST /orders**.
+- **Redis**: `SET key UUID NX EX 86400` (or store hash of request) — **duplicate** returns **same** `order_id` / **409** with prior response body cached **if** required.
+- **Prevents:** duplicate orders on **client retry after timeout**.
+
+### 4.2 Immutable audit trail (separate concern from “app DB”)
+
+- **Every** state transition: `PENDING` → `PARTIAL` → `FILLED` / `CANCELLED` appended to **`order_events`** (append-only table) **in the same transaction** as state change **before** HTTP response (or via **strict** ordering).
+- **Regulatory / forensic:** periodic **export to S3** (immutable bucket, **Object Lock** optional), **separate** from **operational** queries on `orders` main table.
+- **Not** “same as application DB” — **append-only** stream is the **legal** timeline; **current row** is a **projection**.
+
+### 4.3 Sequence numbers and market-data integrity
+
+- Each **symbol** has a monotonic **`sequence_id`** (or **Kafka offset + partition**) on **every** book update / trade published to **MSK**.
+- **Consumers** (WebSocket fan-out, external feeds) **detect gaps** → **request snapshot** via **REST** `GET /book?symbol=X&after_seq=N` and **resync**.
+- **MSK** partition key = **symbol** to preserve **per-symbol** ordering.
+
+### 4.4 Balance locking and oversell prevention
+
+- **Never** “read balance then write later” without **locking** or **reservation**.
+- **Models:**
+  - **Pessimistic:** `SELECT … FOR UPDATE` on **balance row** in Aurora in same txn as **reservation insert**.
+  - **Reservation:** decrement **available**, increment **reserved** atomically; **match** moves **reserved** → **filled**.
+- **Concurrent orders** from one account: **serialized** per **account_id** (shard lock) or **DB constraint** so **sum(reservations) ≤ balance**.
+
+---
+
+## 5. AWS services, rationale, and alternatives *within AWS*
+
+**Clarification vs earlier sketches:** **ElastiCache** is **not** the durable order-book store — it holds **hot snapshots**, **idempotency keys**, and **reservations**; **Aurora** (+ append-only events / outbox) is the **source of truth** (§3.2).
 
 ### Edge and networking
 
 | AWS service | Role | Why this service | Other AWS options considered |
 |-------------|------|------------------|------------------------------|
-| **Route 53** | Public DNS: hostnames (e.g. `api.example.com`, `www.example.com`) as **alias** records to **CloudFront** and/or **ALB**; optional **private hosted zones** for VPC-internal names | Stable customer-facing names; **latency-based** or **weighted** routing for multi-region; **failover** routing with health checks for active-passive DR | **Third-party DNS** (e.g. registrar DNS)—works but you lose native integration with AWS health checks and alias to ALB/CloudFront |
-| **CloudFront** | Static assets; optional caching of idempotent GETs for public market data | Global edge, TLS, reduces origin load | **ALB-only** (no edge cache); **API Gateway** if you need API keys/throttling at the edge (adds latency—use only if required) |
-| **AWS WAF + Shield Standard/Advanced** | Rate limiting, OWASP rules, DDoS mitigation on ALB/CloudFront | Native integration with ALB and CloudFront | **Network ACLs / Security Groups** alone (no L7 rules); WAF is preferred for HTTP abuse |
-| **Application Load Balancer (ALB)** | TLS termination, HTTP/WebSocket routing to ECS targets | L7 routing, health checks, sticky sessions for WebSocket | **NLB** for extreme raw TCP throughput (less HTTP flexibility); **API Gateway HTTP API** for lightweight public APIs (evaluate latency budget) |
+| **Route 53** | Public DNS (ALIAS to CloudFront/ALB); optional private hosted zones | Latency-based / weighted / failover routing | Registrar DNS only (weaker AWS integration) |
+| **CloudFront** | Static assets; optional cache for idempotent GETs | Edge TLS, offload | ALB-only |
+| **AWS WAF + Shield** | L7 rules, rate limits, DDoS | Native on ALB/CloudFront | NACLs/SGs only (no L7) |
+| **ALB** | TLS, HTTP/WebSocket routing, **sticky sessions** for WS (best-effort) | Health checks, cross-zone | NLB if raw TCP only |
 
 ### VPC and internal traffic
 
-| AWS service | Role | Why this service | Other AWS options considered |
-|-------------|------|------------------|------------------------------|
-| **Amazon VPC** | **Isolated virtual network** per region: you define **CIDR**, **subnets** per AZ, **route tables**, and **DNS** settings | **Segmentation**: app and data tiers are not on the public Internet; **east–west** traffic (e.g. ECS -> RDS) stays on private IPs inside the VPC | **Default VPC** (quick tests only); **multi-account** with shared VPC or VPC peering for advanced isolation |
-| **Subnets (public vs private)** | **Public**: ALB, NAT Gateway; route to **Internet Gateway**. **Private**: ECS tasks, RDS, ElastiCache, MSK brokers—**no IGW route** | **Blast-radius control**: only the load balancer tier is directly internet-facing | Single subnet (not recommended for production) |
-| **Internet Gateway (IGW)** | Horizontally scaled attachment to the VPC; **one per VPC** (typical); enables inbound/outbound for **public** subnets | Required for **inbound** HTTPS to ALB from the Internet | **Only public subnets** use IGW routes |
-| **NAT Gateway** | **Outbound** IPv4 from **private** subnets to the Internet (e.g. ECS pulling container images, OS updates, external APIs) | Private workloads stay unroutable **inbound** from the Internet while still reaching out when needed | **NAT instances** (legacy, self-managed); **VPC endpoints** reduce/eliminate NAT for AWS API traffic (S3, ECR, CloudWatch, etc.) |
-| **Security groups** | **Stateful** virtual firewall on ENIs: e.g. allow ALB -> ECS **only** on app ports; ECS -> RDS **only** on 5432; ECS -> Redis on 6379 | **Least privilege** for internal traffic; default deny | **Network ACLs** for **subnet-level** stateless rules (optional extra layer) |
-| **VPC endpoints (Gateway / Interface)** | **Private connectivity** to AWS services (e.g. **S3** Gateway endpoint, **ECR/CloudWatch Logs** Interface endpoints) without traversing the public Internet | **Lower cost** than NAT for heavy AWS API usage; traffic stays on the **AWS backbone**; helps **p99** and security posture | **AWS PrivateLink** to SaaS or your own services |
+| AWS service | Role | Why | Other AWS options |
+|-------------|------|-----|-------------------|
+| **VPC, subnets** | Public (ALB, NAT); private (ECS, RDS, Redis, MSK) | Blast-radius | Default VPC (non-prod) |
+| **IGW / NAT / VPC endpoints** | Inbound path; outbound; private AWS API access | Cost + security | NAT instance (legacy) |
+| **Security groups** | Least-privilege east–west | Stateful | NACLs optional |
 
-### Compute (API and matching engine)
-
-| AWS service | Role | Why this service | Other AWS options considered |
-|-------------|------|------------------|------------------------------|
-| **Amazon ECS on Fargate** | REST and WebSocket services; auto-scaling | No cluster EC2 management; multi-AZ; fits 500 RPS with small task count | **EKS** if you need Kubernetes ecosystem; **EC2 + ASG** for lowest per-unit cost or custom AMIs; **Lambda** for non-hot paths only (cold start hurts p99) |
-| **EC2 (e.g. `c7i` / `c6i`) in a Placement Group** (matching engine) | CPU-bound matching with stable latency | Predictable CPU, optional same-AZ co-location with ElastiCache/DB | **Fargate** for matching only if latency variance is acceptable; dedicated hosts for compliance |
-
-### Data and messaging
-
-| AWS service | Role | Why this service | Other AWS options considered |
-|-------------|------|------------------|------------------------------|
-| **Amazon Aurora PostgreSQL** (or **RDS PostgreSQL**) | Orders, accounts, audit, id generation | Aurora: fast failover, read replicas, good for HA; RDS: simpler/cheaper at small scale | **DynamoDB** for key-value hot paths (sub-ms) if you refactor to NoSQL; **RDS Proxy** strongly recommended in front of either for connection pooling and failover |
-| **Aurora replicas / RDS read replicas** | Read-heavy paths (history, public lists) | Keeps primary free for writes; supports p99 read SLAs | **ElastiCache** as first line—replicas for complex queries |
-| **ElastiCache for Redis** (cluster mode enabled as needed) | Order book snapshots, tickers, rate limits, pub/sub for cache invalidation | Sub-ms reads; reduces DB load—critical for **< 100 ms p99** | **DAX** only if you move reads to DynamoDB; **Memcached** if no pub/sub needed |
-| **Amazon MSK (Kafka)** or **SQS + SNS** | Trade events, fan-out to WebSocket and analytics | MSK: ordering + replay; SQS: simpler ops, multi-AZ, slightly higher typical latency—choose based on ordering needs | **Kinesis Data Streams** for high-throughput streaming with different consumer model |
-| **S3 + lifecycle** | Cold archives, exports, compliance dumps | Durable, cheap | **EFS** only if POSIX shared files needed |
-
-### Observability
+### Compute
 
 | AWS service | Role | Why | Other AWS options |
 |-------------|------|-----|-------------------|
-| **CloudWatch** | Metrics, alarms, dashboards (ALB latency, ECS CPU, RDS, Redis) | Native integration | **X-Ray** for distributed tracing (order path debugging) |
-| **CloudWatch Logs / OpenSearch** | Centralized application logs | Audit and troubleshooting | **Kinesis Firehose** to S3 for long retention |
+| **ECS Fargate** | Stateless API + WebSocket | Ops simplicity, multi-AZ | EKS, EC2 ASG |
+| **EC2 (e.g. `c7i`) + ASG** | **Matching engine** + optional **etcd** nodes | Predictable CPU, placement groups for latency | Fargate for matching if variance acceptable |
+
+### Data and messaging
+
+| AWS service | Role | Why | Other AWS options |
+|-------------|------|-----|-------------------|
+| **Aurora PostgreSQL** | Orders, balances, **order_events**, **outbox** | Durable, failover, replicas | DynamoDB for specialized KV |
+| **RDS Proxy** | Pooling, failover handling | Tail latency | Direct connect without proxy |
+| **ElastiCache Redis** | Idempotency, reservations, **hot book** (non-durable) | Sub-ms | DAX if DynamoDB |
+| **MSK (Kafka)** | Sequenced match/book events; consumer lag metrics | Ordering + replay | Kinesis, SQS (different semantics) |
+| **S3 + Object Lock** | Long-term **audit** exports | Compliance, cheap | — |
+
+### Observability and incident response
+
+| AWS service | Role | Why | Other AWS options |
+|-------------|------|-----|-------------------|
+| **CloudWatch** | Metrics, **alarms → SNS** | Native | — |
+| **X-Ray** or **ADOT** | **Distributed traces** (§8) | p99 root cause | Self-hosted Jaeger |
+| **SNS** | Fan-out to **PagerDuty** / email / Lambda | Escalation | EventBridge for complex routing |
 
 ---
 
-## 4. Meeting Throughput (500 RPS) and Latency (p99 < 100 ms)
+## 6. Throughput, and end-to-end latency budget (p99 < 100 ms)
 
-### Throughput: 500 RPS
+### 6.1 Throughput: 500 RPS
 
-- **Headroom:** 500 RPS is modest for a small ECS/Fargate service behind ALB; a **single Availability Zone** can handle this with **2–4 Fargate tasks** (e.g. 0.5 vCPU / 1 GB each) for typical JSON APIs, with auto-scaling for redundancy.
-- **Sizing:** Target **~50–100 RPS per task** in load tests to leave CPU for spikes and keep p99 stable; scale out with **Application Auto Scaling** on ALB `RequestCountPerTarget` or CPU.
-- **Non-hot traffic:** Offload read-heavy public endpoints to **CloudFront** (short TTL) or **ElastiCache** so origin sees fewer than 500 RPS if a large share is cacheable market data.
+- **Headroom:** **2–4 Fargate tasks**, **Application Auto Scaling** on `RequestCountPerTarget` or CPU.
+- **CloudFront** for cacheable GETs reduces origin RPS.
 
-### Latency: p99 < 100 ms (synchronous API)
+### 6.2 Latency budget — **validated** claim, not hope
 
-Design rules that keep the critical path short:
+**Scope:** **Read-heavy** synchronous API (e.g. **GET ticker**, **GET shallow book** from Redis) — the **stated** p99 < 100 ms target. **Order submit** that **touches Aurora sync write + match** may be **higher** unless optimized; **separate** business SLO for **ack-to-client** (§8).
 
-1. **Same region** – Deploy all components in one region (e.g. `ap-southeast-1`); clients measured against this region for the Service Level Object(SLO).
-2. **ElastiCache first** – Public ticker, shallow order book, and session/rate-limit data should hit **Redis** in **< 1–2 ms**; avoid DB on the hot path where possible.
-3. **RDS Proxy** – Pool connections from ECS tasks to **Aurora/RDS** to avoid connection storms and reduce tail latency on connect.
-4. **Minimal hops** – REST -> (optional Redis) -> RDS Proxy -> Aurora; avoid synchronous calls to MSK/SQS on the latency-critical response path (use async after ack where acceptable).
-5. **ALB tuning** – HTTP keep-alive from clients; appropriate idle timeout; target group health checks without aggressive flapping.
-6. **Payload and serialization** – Small JSON responses; avoid N+1 queries; index hot queries in PostgreSQL.
+| Segment | Budget (typical p50 / **allow for p99 tail**) | Notes |
+|---------|-----------------------------------------------|--------|
+| **ALB + TLS** | ~0.5–2 ms / **~1–3 ms** | Cross-AZ hop adds **~1 ms** if client not co-located |
+| **ECS processing + JSON** | ~2–5 ms / **~5–12 ms** | GC, serialization — **right-size** tasks |
+| **Redis round-trip** | ~0.2–1 ms / **~1–3 ms** | Same-AZ |
+| **RDS Proxy + Aurora read** | ~1–3 ms / **~5–20 ms** | **Writes** higher: **~10–25 ms** sync commit Multi-AZ typical |
+| **MSK** | **0 ms on critical path** if **async** after commit | **Fire-and-forget** from outbox relay — **must not** block HTTP if SLO is read path |
 
-**Order placement** (writes + matching) may need a **separate internal Service Level Object(SLO)** (e.g. p99 < 50 ms inside matching engine) while the **HTTP p99 < 100 ms** still assumes the matching step completes within budget—achieved by co-locating matching with Redis/DB in the same AZ and keeping the critical section short.
+**Example — hot read path (GET, Redis hit):**  
+~1 + ~6 + ~2 + ~0 = **~9 ms p50**, **~25–40 ms p99** with tail — **within 100 ms** if no Aurora on path.
 
-### Validation
+**Example — write path (order submit, Aurora commit in request):**  
+ALB + ECS + Redis idempotency + **Aurora txn** + **no blocking MSK** ≈ **25–50 ms p50**, **~60–90 ms p99** in a tuned region — **still feasible** for < 100 ms **if** matching is **fast** and **one** round-trip to DB; **leave ~10–40 ms** for **GC, spikes, cold pool**.
 
-- Load test with **k6** against ALB URL: ramp to **500 RPS** sustained, measure **p99** from client (not only ALB `TargetResponseTime`).
-- CloudWatch: **ALB TargetResponseTime p99**, **ECS CPU/memory**, **RDS** `DatabaseConnections`, **ElastiCache** `CurrConnections` and CPU.
+**Explicit:** **p99 < 100 ms** as a **platform** constraint should be **scoped** (e.g. **“public read APIs”** vs **“order accept ack”**) — both **budgeted** separately in production.
 
----
+### 6.3 Validation
 
-## 5. High Availability Approach
-
-- **Multi-AZ deployment**  
-  **VPC** spans **at least two Availability Zones** with **public and private subnets per AZ** (e.g. ALB with cross-zone enabled; ECS tasks and Multi-AZ RDS/ElastiCache/MSK). No single AZ failure should take the system down.
-
-- **Stateless API tier**  
-  REST and WebSocket servers hold no durable state; scale out horizontally behind ALB. Sticky sessions (or connection routing) only where needed for WebSocket to preserve connection affinity without single-point dependency.
-
-- **Matching engine (on ECS or EC2)**  
-  - Single logical order book with a leader (active) and standby; use a consensus layer (e.g. Raft) or automated failover for the engine tier.  
-  - Failover: promote standby, replay from WAL or event log, then resume ingestion. Order book state persisted to durable store (DB or replicated log).
-
-- **Data stores**  
-  - Database: Multi-AZ primary + synchronous or asynchronous replicas; automated failover (RDS Multi-AZ / Aurora).  
-  - Cache: Redis cluster or multi-node with replication so one node failure does not lose availability.  
-  - Queue: Multi-AZ Kafka cluster or SQS (already multi-AZ) so message durability and availability survive AZ loss.
-
-- **Health checks and failover**  
-  - ALB health checks on REST and WebSocket targets; unhealthy instances removed from rotation.  
-  - DB and cache failover automated by managed services or orchestrator.  
-  - Alerts on high error rate, latency, and matching-engine lag; runbooks for manual override if needed.
-
-- **Graceful degradation**  
-  - Read-only mode: disable new orders if DB or matching engine is impaired; keep market data and balance reads where possible.  
-  - Circuit breakers and timeouts so a failing dependency does not cascade.
+- **k6** with **client-side** p99, **X-Ray** waterfall (§8).
+- **CloudWatch** ALB `TargetResponseTime` **per target group** — **not** sole source of truth.
 
 ---
 
-## 6. Scaling When the Product Grows
+## 7. High availability — engineered, not only “multi-AZ”
 
-### Horizontal scaling (short term)
+This section defines the **high availability (HA) design** for the trading data plane. The **primary** pattern is **Multi-AZ architecture** within a single **AWS Region**: isolate failure to an **Availability Zone** (AZ) without losing the **region**, while **matching-engine** correctness rules (§3, §7.3) still apply.
 
-- **API tier**  
-  Add more REST and WebSocket pods/nodes; ALB distributes traffic. Scale by CPU/connection count or request rate (App Autoscaling policy managed by AWS)
+### 7.1 High availability design — Multi-AZ architecture
 
-- **Read path**  
-  Add more read replicas; route read-only queries (order history, account balance reads, public market data) to replicas. Use cache for hottest data (e.g. top of book, recent trades).
+**Goals**
 
-- **Message consumers**  
-  Scale consumers for trade/event pipeline (WebSocket fan-out) with partition-based parallelism (Kafka partitions or SQS consumers).
+| Goal | What Multi-AZ delivers |
+|------|-------------------------|
+| **Fault isolation** | Loss of **one** AZ (power, networking, single-AZ service incident) should **not** take down the **entire** trading stack. |
+| **Continued ingress** | **ALB** keeps routing to **healthy targets** in surviving AZs (**cross-zone load balancing** enabled). |
+| **Data durability** | **Aurora** / **MSK** / **ElastiCache Multi-AZ** replicate or failover **within the region** per service model. |
+| **Operational clarity** | Each tier’s **failure domain** is documented (below) so **on-call** knows what **auto-recovers** vs what needs **incident runbooks** or manual steps. |
 
-### Matching engine and order book (medium term)
+**VPC layout (conceptual)**
 
-- **Vertical scaling**  
-  Scale matching-engine nodes (CPU/memory) and use dedicated instances/placement groups to maximize throughput per book.
+- **One VPC** per **region** (e.g. `ap-southeast-1`), **non-overlapping** private CIDRs.
+- **Minimum two AZs** in use: e.g. **`ap-southeast-1a`** and **`ap-southeast-1b`** (use **real AZ IDs** that map to **different** physical locations for your account).
+- **Per AZ:** **public subnets** (ALB ENIs, NAT Gateway) + **private subnets** (ECS tasks, matching engine, **ElastiCache**, **MSK** broker ENIs, **Aurora** via managed placement).
+- **Route tables:** Public subnets → **Internet Gateway**; private subnets → **NAT Gateway** (per AZ or shared per cost/HA trade-off) + **VPC endpoints** for AWS APIs.
 
-- **Symbol sharding**  
-  Partition symbols across multiple matching-engine instances (e.g. by symbol or symbol range). Each instance owns a subset of order books;
-API routes orders to the correct instance via routing layer or message topic. Shared cache and DB still hold global view for reporting and risk.
+```mermaid
+flowchart TB
+    subgraph Region["AWS Region — e.g. ap-southeast-1"]
+        subgraph AZ_A["Availability Zone A"]
+            PUB_A[Public subnets — ALB ENI / NAT]
+            PRIV_A[Private subnets — ECS / matching / data clients]
+        end
+        subgraph AZ_B["Availability Zone B"]
+            PUB_B[Public subnets — ALB ENI / NAT]
+            PRIV_B[Private subnets — ECS / matching / data clients]
+        end
+    end
 
-### Data and cost (medium / long term)
+    ALB[Application Load Balancer — spans AZs]
+    ALB --> PUB_A
+    ALB --> PUB_B
+    PRIV_A <--> PRIV_B
+```
 
-- **DB**  
-  - Partition large tables (e.g. orders, trades) by time and/or symbol.  
-  - Archive cold data to object storage (S3); keep hot data in primary or replicas.
-  - Could use AWS Data Migration Service for replica tasks.
+**Multi-AZ placement by component**
 
-- **Cache**  
-  - Scale Redis cluster (more shards or larger nodes).  
-  - Segment cache by use (e.g. order book vs session vs rate limit) if needed.
+| Layer | Multi-AZ pattern | If one AZ is impaired |
+|-------|------------------|------------------------|
+| **Route 53 / CloudFront / WAF** | **Regional** edge services; not AZ-scoped | Rare full-edge outages; **failover** to another region is a **separate** DR design (§9). |
+| **ALB** | **Multi-AZ** by default; targets registered **per AZ** | **Unhealthy targets** in bad AZ **removed**; traffic flows to **other** AZs (**cross-zone** ON). |
+| **ECS Fargate / EC2 workers** | **Tasks/instances** spread across **≥2 AZs** (capacity providers / ASG **AZ rebalancing**) | **Scheduler** replaces tasks; **min healthy %** on deploy avoids **total drain**. |
+| **Matching engine + etcd** | **Leader + followers** across **AZs** (§3.3); **quorum** survives **one** AZ loss if **3+ nodes** | **Election** or **read-only** until quorum (**§7.3**); **RTO** in §3.4. |
+| **Aurora PostgreSQL** | **Cluster volume** replicated **across AZs**; **primary** in one AZ, **failover** to replica | **Automatic failover** (typically **~30–120 s** for detection + promotion — **document** for SLOs). |
+| **RDS Proxy** | **Multi-AZ** endpoint; **sticky** to **writer** / **reader** routing | **Reconnect** storm mitigation; **failover** handling without **app** hardcoding DB hostname churn. |
+| **ElastiCache Redis** | **Multi-AZ with replica**; **automatic failover** of primary | **Brief** unavailability or **read-only** replica promotion; **cache rebuilt** from **Aurora** if needed (§3.2). |
+| **MSK (Kafka)** | **Brokers** across **≥3 AZs** (recommended); **replication factor** ≥ 3 | **Partition** **under-replicated** until broker back; **producers** retry (**outbox** preserves **durability** — §3). |
 
-### Global / multi-region (long term)
+**ALB cross-zone load balancing**
 
-- **Active-passive or active-active**  
-  - Secondary region for DR (replicated DB, standby matching engine, RTO/RPO defined).  
-  - For true global low latency: per-region order books (e.g. by region or instrument), with clear consistency boundaries and reconciliation.
+- **Enable** cross-zone on target groups so **clients** are not stuck if their **AZ** has **fewer** healthy targets.
+- **Trade-off:** Slightly **higher** cross-AZ **latency** (~1 ms) vs **AZ-local-only** routing — for **500 RPS** and **p99** SLO, cross-zone is usually **acceptable** (§6).
 
-- **Market data**  
-  - Replicate market data (tickers, depth, trades) to multiple regions via queue or CDN-like distribution so global users get low-latency reads.
+**What Multi-AZ does *not* solve**
+
+| Limitation | Implication |
+|------------|-------------|
+| **Region-wide** failure | **Multi-AZ** ≠ **multi-region**; **DR** second region + **Route 53** failover / **pilot light** stack (**§9**). |
+| **Logical bugs** | **Duplicate fills**, **bad balances** — **correctness** in **§3–4**, not fixed by AZ redundancy. |
+| **Split-brain matching** | **Network partition** between AZs — **§7.3**; **fail closed** over **double trading**. |
+
+**Summary checklist (design review)**
+
+- [ ] **≥2 AZs** used for **compute** and **stateful** data (**Aurora**, **MSK**, **ElastiCache** configs reviewed).  
+- [ ] **ALB** health checks + **cross-zone** + **connection draining** on deploy.  
+- [ ] **Matching** **quorum** layout documented (**3+** nodes across AZs).  
+- [ ] **Runbook**: **Aurora failover** + **matching** **no-leader** behavior + **customer messaging** (status page).
+
+### 7.2 WebSocket affinity and failover
+
+| Issue | Mitigation |
+|-------|------------|
+| **ECS task dies** | **Sticky sessions** help only that task — on death, **connections drop**. |
+| **Client behavior** | **Exponential backoff reconnect**; **resume** from **`Last-Event-ID` / sequence** (§4.3). |
+| **Missed events during reconnect** | **Gap detection** on sequence → **snapshot resync** REST call. |
+| **Grace period** | Document **max silence** before client must **snapshot**; server may send **heartbeat** + **seq**. |
+
+**ALB sticky** is **best-effort**; **stateless WS** design: **subscribe** after reconnect with **from_seq**.
+
+### 7.3 Split-brain and matching engine partition
+
+| Scenario | Policy |
+|----------|--------|
+| **Leader** loses **quorum** (AZ link flap) | **Step down** — **no** match without **lease** + **fencing**; **reject** orders with **503** rather than **risk double match**. |
+| **Standby** thinks it’s leader | **etcd/Raft** prevents **two leaders** with **votes**; **old leader** must **stop** writing (**fenced** via **monotonic token** in Aurora). |
+| **Orders during uncertainty** | **Fail closed**: **better** short **unavailability** than **duplicate fills**. |
+
+### 7.4 Read-only mode — concrete mechanics
+
+**Trigger (examples — tune in runbooks):**
+
+| Signal | Threshold (example) | Action |
+|--------|----------------------|--------|
+| Aurora **primary** unhealthy / **failover** in progress | **CloudWatch** RDS `DatabaseConnections` + **event** `RDS-EVENT` | **API middleware** flips **`TRADING_HALTED=true`** in **Parameter Store** / **feature flag**; **POST /orders** → **503** with JSON body `{ "code": "READ_ONLY" }` |
+| Matching engine **no leader** > **N seconds** | **Health check** + **etcd** metrics | Same |
+| **Error rate** from matching **> 5%** for **2 min** | **CloudWatch alarm** | **Circuit**: stop **new** orders; **GET** still allowed if **replicas** healthy |
+
+**Implementation:** **Envoy/NGINX** or **app** checks **flag**; **no** vague “circuit breakers” without **numbers**.
 
 ---
 
-## 7. How this design maps to the constraints
+## 8. Observability — beyond table stakes
+
+### 8.1 Distributed tracing (required for p99 investigations)
+
+- **AWS X-Ray** (or **OpenTelemetry** → **ADOT** → X-Ray/Jaeger) on **full write path**: **ALB segment** → **ECS** → **Redis** → **Aurora** → **outbox relay** → **MSK**.
+- **Sampling:** **100%** for **errors**; **1–10%** for success at scale — **always** trace **slow** requests (**tail sampling**).
+
+Without a **single waterfall**, p99 spikes are **guesswork**.
+
+### 8.2 Business-level SLOs and alerts
+
+| SLO (examples) | Measure | Not a default CloudWatch metric |
+|----------------|---------|--------------------------------|
+| **Order accept latency** | Time from **ingress** to **HTTP 200** with `order_id` | Custom **app timer** + X-Ray |
+| **Match-to-WS lag** | `match_commit_time` → **first WS frame** with same `seq` | **MSK consumer lag** + **app** |
+| **WebSocket drop rate** | Connections closed / min | **ALB** `ClientTLSNegotiationError` + **app** |
+| **Fill correctness** | **Reconciliation** job: **sum(fills) = order_events** | **Batch** + **alarm** on mismatch **> 0** |
+
+### 8.3 Alerting pipeline and escalation
+
+| Component | AWS pattern |
+|-----------|-------------|
+| **Alarms** | **CloudWatch Alarm** → **SNS topic** `critical-trading` |
+| **Paging** | **SNS** → **PagerDuty** / **Opsgenie** integration (or **Lambda** → webhook) |
+| **Runbooks** | Link in **alarm description**; **on-call rotation** in PagerDuty |
+| **Dashboards** | **CloudWatch dashboard** + **X-Ray** service map **+** business SLO panel |
+
+**Technical-only** “ALB p99” is **insufficient** for **trading** — **composite** pages for **SLO burn rate**.
+
+---
+
+## 9. Scaling when the product grows
+
+- **Horizontal:** ECS for API/WS; **MSK** partitions; **Aurora** read replicas.
+- **Matching:** **Vertical** first; then **symbol sharding** with **routing** layer.
+- **Global:** DR region, **latency-based** Route 53, **per-region** books (consistency boundaries).
+
+---
+
+## 10. How this design maps to the constraints
 
 | Constraint | How the design satisfies it |
 |------------|-----------------------------|
-| **AWS only** | All components in §3 are **AWS-native** (Route 53, CloudFront, WAF, VPC subnets / IGW / NAT / security groups / VPC endpoints, ALB, ECS Fargate, Aurora/RDS, RDS Proxy, ElastiCache, MSK or SQS/SNS, CloudWatch, S3). No dependency on other clouds for the core path. |
-| **500 RPS** | **##4** shows capacity headroom (small ECS/Fargate fleet with auto-scaling); 500 RPS is well below typical per-task limits when cache + DB are sized correctly. |
-| **p99 < 100 ms** | **##4** lists latency design rules (same region, Redis on hot path, RDS Proxy, minimal hops, no async blocking on the response path). **##5** Multi-AZ keeps availability without forcing cross-region latency for the stated Service Level Object(SLO). |
+| **AWS only** | **Route 53, CloudFront, WAF, VPC, ALB, ECS, EC2 (matching/etcd), Aurora, RDS Proxy, ElastiCache, MSK, S3, X-Ray, CloudWatch, SNS, Parameter Store** — data plane as in §2–5. |
+| **500 RPS** | §6.1 — small ECS footprint with headroom. |
+| **p99 < 100 ms** | §6.2 **end-to-end budget**; scoped to **read** vs **write** paths; validated with **k6 + X-Ray** (§8). |
+| **High availability** | §7.1 **Multi-AZ architecture** (VPC, ALB, ECS, Aurora, MSK, ElastiCache, matching quorum); §7.2–7.4 **session**, **partition**, **degraded** modes. |
 
-**Cost-effectiveness at this scale:** Prefer **Fargate + Aurora Serverless v2** (or small RDS) for bursty workloads; **Reserved Capacity** or **Savings Plans** once traffic is stable; **S3** for archives; right-size ElastiCache and ECS tasks after load testing.
+**Cost:** Fargate + Aurora Serverless v2 or rightsized RDS; **Savings Plans** when stable.
+
+---
+
+## References in this document
+
+| § | Topic |
+|---|--------|
+| §2 | Diagrams: planes, AZ, read/write, service roles |
+| §3 | Matching engine: consistency, persistence, Raft/etcd, RTO |
+| §4 | Idempotency, audit, sequencing, balances |
+| §6 | Latency budget |
+| §7 | **HA design: Multi-AZ** (§7.1), WebSocket, split-brain, read-only mode |
+| §8 | Observability: X-Ray, business SLOs, PagerDuty/SNS |
+| §9 | Scaling and multi-region / DR notes |
+| §10 | Constraint mapping |
