@@ -1,7 +1,6 @@
-# Problem 2 – Highly Available Trading System Architecture
+# Castle In The Cloud — Highly Available Trading System on AWS
 
 Design of a resilient, scalable, cost-effective trading platform inspired by core Binance-style features, with emphasis on availability, **correctness**, and scalability.
-
 ---
 
 ## 0. Constraints (as specified)
@@ -16,21 +15,26 @@ Non-functional paths (e.g. async analytics, batch exports) are excluded from the
 
 ---
 
-## 1. Features in Scope
+## 1. Features selected (scope vs breadth)
 
-- **Order management** – Place/cancel orders (limit, market), order book
-- **Matching engine** – Central order matching with **defined consistency** and **immutable audit**
-- **Market data** – Real-time ticker, depth, and trades via WebSocket
-- **Account & balances** – Wallet balances, position tracking (simplified)
-- **REST + WebSocket APIs** – Public (market data) and private (orders, account) with auth
+You cannot cover all of Binance; pick features that prove **HA, scalability, real-time behavior, and financial correctness**.
 
-Out of scope: full custody, fiat rails, complex margin/derivatives, KYC pipelines.
+| Feature area | In this design | Why it matters |
+|--------------|----------------|----------------|
+| **Identity & API security** | **Cognito** JWT, **IAM** task roles, **KMS**, **WAF** | Trust boundary for money-moving APIs |
+| **Spot trading / matching** | Single-writer **matching engine**, **Aurora** durability, **§3** | Core latency + **at-most-once** fills |
+| **Order book & market data** | **MSK** + **WebSocket** fan-out, **sequence** IDs **§4.3** | Real-time + gap detection |
+| **Wallet / balances** | **Reservations**, **Aurora** ACID **§4.4** | Prevents oversell |
+| **Trade history & audit** | **order_events**, **S3** export **§4.2** | Compliance + replay |
+| **Observability** | **X-Ray**, **CloudWatch**, business SLOs **§8** | p99 and fill-latency investigations |
+
+**Out of scope (explicit):** full **KYC** pipelines, **fiat** rails, **margin/derivatives**, full **custody**—same boundary as a focused architecture exercise.
 
 ---
 
 ## 2. Architecture overview — diagrams and planes
 
-The deliverable asks for an **overview of services and roles**. Start with the **architecture overview** (§2.1), then **control vs data plane** (§2.2), **Multi-AZ** detail (§2.3), **read/write paths** (§2.4), and the **service role** table (§2.5).
+The deliverable asks for an **overview of services and roles**. Flow: **§2.1** overview diagram → **§2.2** control/data plane → **§2.3** Multi-AZ → **§2.4** read/write → **§2.5** order-flow **sequence** → **§2.6** service index (details in **§5**).
 
 ### 2.1 Architecture overview diagram
 
@@ -202,21 +206,45 @@ flowchart TB
 
 **MSK publish:** For **HTTP 200** semantics, the design **commits durable state in Aurora first**, then produces to MSK (or uses **outbox pattern** so MSK failure does not lose events — see §3). **p99 < 100 ms** assumes the **synchronous** segment stays within budget (§6).
 
-### 2.5 Diagram C — Where each service sits (role summary)
+### 2.5 Order flow — sequence diagram (critical path)
 
-| Service | Role in one line |
-|---------|------------------|
-| **Route 53 / CloudFront / WAF / ALB** | DNS, edge cache, L7 security, **ACM TLS**, route to ECS. |
-| **Cognito User Pool** | **OIDC / JWT** for users; ECS validates **Bearer** tokens (**JWKS**). |
-| **KMS / Secrets Manager** | **SSE-KMS** for Aurora & S3; **Secrets Manager** for DB/MSK creds to tasks (**IAM**-scoped). |
-| **IAM** | **Task roles** for ECS/EC2 — **least privilege** to AWS APIs (**no** static keys in images). |
-| **ECS Fargate** | Stateless API + WebSocket **front**; **JWT validation**; no order book truth. |
-| **Matching engine (EC2 or ECS)** | **Single-writer** per symbol shard; **leader** + **standby**; **Raft/etcd** or external coordination (§3). |
-| **Aurora PostgreSQL** | **System of record**: orders, balances (or reservations), **append-only audit** tables, **outbox** for MSK. |
-| **ElastiCache Redis** | Idempotency keys, **balance reservations**, **hot book snapshot**, rate limits — **not** durable recovery source. |
-| **MSK (Kafka)** | **Sequenced** market-data and trade events; replay and gap detection. |
-| **S3** | Long-retention **immutable** audit exports, compliance. |
-| **X-Ray + CloudWatch** | **Distributed trace** of write path; metrics; **business SLO** dashboards (§8). |
+Simplified **happy path** (single region; **ECS** hosts API—**not** API Gateway WebSocket as in some EKS-centric designs). Matches **§2.4** write path.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant E as Edge ALB+WAF
+    participant A as ECS API
+    participant R as Redis
+    participant M as Matching leader
+    participant D as Aurora
+    participant K as MSK
+
+    C->>E: HTTPS POST /orders Bearer JWT
+    E->>A: Forward
+    A->>A: Validate JWT Cognito JWKS
+    A->>R: Idempotency key check
+    A->>M: Route order to shard
+    M->>D: Txn: orders fills reservations outbox
+    M->>R: Update hot book snapshot async
+    D-->>M: Commit OK
+    M->>K: Produce match event async
+    M-->>A: Ack
+    A-->>C: 200 order_id
+    Note over K: Consumers fan-out WS market data
+```
+
+### 2.6 Service index (detail in §5)
+
+| Tier | AWS components |
+|------|----------------|
+| **Edge** | Route 53, CloudFront, WAF, **ALB + ACM** |
+| **Identity & secrets** | Cognito, IAM task roles, Secrets Manager, KMS |
+| **Compute** | **ECS Fargate** (API/WS); **EC2/ECS** (matching + **etcd**) |
+| **Data** | Aurora + RDS Proxy, ElastiCache, MSK, S3 |
+| **Observability** | CloudWatch, X-Ray |
+
+Full **rationale and alternatives** table is in **§5** (avoids duplicating edge/data rows here).
 
 ---
 
@@ -313,6 +341,20 @@ Requirements that **generic** web stacks often omit.
   - **Reservation:** decrement **available**, increment **reserved** atomically; **match** moves **reserved** → **filled**.
 - **Concurrent orders** from one account: **serialized** per **account_id** (shard lock) or **DB constraint** so **sum(reservations) ≤ balance**.
 
+### 4.5 MSK topic design (Kafka)
+
+**Partition key:** **`symbol`** (or **symbol shard**) so **per-symbol** order is preserved. Example topic names:
+
+| Topic | Typical producers | Consumers |
+|-------|-------------------|-----------|
+| `orders.submitted` | API (after idempotency) | Matching engine |
+| `orders.matched` | Matching engine | Wallet projection, history, **market data** |
+| `orders.cancelled` | Matching / API | Wallet, notifications |
+| `market.trades` | Matching | WebSocket / external feeds |
+| `market.book.delta` | Matching | Real-time depth (optional vs snapshot API) |
+
+**Note:** Durable **truth** remains **Aurora**; MSK is for **ordered fan-out** and **replay** (see **outbox** in §3 if producer must not lose events).
+
 ---
 
 ## 5. AWS services, rationale, and alternatives *within AWS*
@@ -340,7 +382,7 @@ Requirements that **generic** web stacks often omit.
 
 | AWS service | Role | Why | Other AWS options |
 |-------------|------|-----|-------------------|
-| **ECS Fargate** | Stateless API + WebSocket | Ops simplicity, multi-AZ | EKS, EC2 ASG |
+| **ECS Fargate** | Stateless API + WebSocket | Ops simplicity, multi-AZ | **EKS** if you need many microservices + **LB controller**; **EC2 ASG** for bare-metal control |
 | **EC2 (e.g. `c7i`) + ASG** | **Matching engine** + optional **etcd** nodes | Predictable CPU, placement groups for latency | Fargate for matching if variance acceptable |
 
 ### Data and messaging
@@ -360,67 +402,22 @@ Requirements that **generic** web stacks often omit.
 | **CloudWatch** | Metrics, **alarms → SNS** | Native | — |
 | **X-Ray** or **ADOT** | **Distributed traces** (§8) | p99 root cause | Self-hosted Jaeger |
 | **SNS** | Fan-out to **PagerDuty** / email / Lambda | Escalation | EventBridge for complex routing |
+| **Managed Grafana** (optional) | Dashboards over **CloudWatch** / **X-Ray** | Single pane for ops + SLOs | Self-hosted Grafana on ECS/EKS |
 
-### Security and identity
+### Security and identity (consolidated)
 
-Trading systems require **defense in depth**: network isolation (§5 VPC), **strong identity** for humans and software, **encryption**, and **auditable** access to data and control planes.
+| Area | Approach | AWS |
+|------|------------|-----|
+| **Humans / CI** | SSO, no static keys in repos | **IAM Identity Center**, **OIDC** to CI **→** **IAM roles** |
+| **Workloads** | **Task roles** / instance profiles; least privilege to **S3/KMS/MSK** only | **IAM**, **STS** |
+| **End users** | **JWT** (**Cognito** User Pools); scopes (`orders:write`, …); **server-side** `sub` → **account** binding | **Cognito** |
+| **Secrets** | DB/MSK creds **rotated** where possible | **Secrets Manager** + **RDS Proxy** integration |
+| **Config flags** | `TRADING_HALTED`, etc. | **Parameter Store** **SecureString** + **KMS**; **IAM** who can change (**§7.4**) |
+| **Encryption** | TLS everywhere (ALB/CF/Redis/MSK); **SSE-KMS** Aurora & S3; **EBS** volumes | **ACM**, **KMS** |
+| **Audit / detect** | Infra changes + data-plane audit | **CloudTrail** org trail; Aurora audit logs; **order_events** **§4.2**; optional **GuardDuty**, **VPC Flow Logs** |
+| **SDLC** | Supply-chain | **ECR** scan, **IaC** scan (**Checkov**), pen test policy |
 
-#### Identity and access management (IAM)
-
-| Layer | Pattern | AWS services / notes |
-|-------|---------|----------------------|
-| **Workloads → AWS APIs** | **Least privilege** IAM **roles** attached to **ECS task roles** (Fargate) and **EC2 instance profiles** (matching engine, etcd) — **no long-lived access keys** in containers | **IAM**, **STS** for temporary creds; **scoped** policies: e.g. `s3:PutObject` only on `arn:…/audit/*`, `kms:Decrypt` only for specific CMKs |
-| **Humans / operators** | **No shared root**; **SSO** to **roles** with **short sessions** | **IAM Identity Center** (SSO) → **permission sets** → **roles** in accounts; **break-glass** emergency role **MFA**-gated and **CloudTrail**-alerted |
-| **CI/CD and IaC** | **OIDC** from GitHub Actions / CodePipeline to **assume role** — no static keys in repos | **IAM OIDC identity provider** |
-| **Cross-account** (if used) | **Resource policies** + **role assumption** with **external ID** | Document **trust** boundaries |
-
-#### Client-facing identity (API consumers)
-
-| Concern | Approach | Notes |
-|---------|----------|--------|
-| **End users (web/mobile)** | **Amazon Cognito** (User Pools) — **OAuth 2.0 / OIDC**; **JWT access tokens** validated by **ECS** (JWKS) | **Scopes** map to **trading** actions (e.g. `orders:write`, `account:read`); **short-lived** tokens + **refresh** rotation |
-| **Machine / API clients** | **API keys** in **Secrets Manager** or **Cognito** app clients + **client credentials**; **rate limits** at **WAF** + **application** | **Never** log raw secrets; **hash** or **reference by ID** in audit |
-| **Public market data** | **Unauthenticated** or **optional** API key tier | **Separate** paths from **private** order APIs — **WAF** rules per route |
-
-**Authorization:** Enforce **account_id** (or `sub` from token) **matches** resource being traded — **server-side** only; **no** trust of client-supplied account without **cryptographic** binding to identity.
-
-#### Secrets and key management
-
-| Secret type | Store | Practice |
-|-------------|-------|----------|
-| **DB passwords, MSK SASL, third-party API keys** | **AWS Secrets Manager** — **rotation** where supported | ECS tasks **inject** at runtime via **task definition** secrets; **RDS Proxy** can use **Secrets Manager** integration |
-| **Non-secret config** (feature flags, `TRADING_HALTED`) | **Systems Manager Parameter Store** (**Hierarchical** + **SecureString** with **KMS**) | **IAM** restricts **who** can flip trading halt flags (§7.4) |
-| **TLS private keys (if not using ACM)** | **Secrets Manager** or **ACM**-managed certs on **ALB** | Prefer **ACM** for **ALB** public certs |
-
-#### Encryption
-
-| Data state | Mechanism |
-|------------|-----------|
-| **In transit (Internet → ALB)** | **TLS 1.2+**; **modern cipher** policy on **ALB** / **CloudFront**; **HSTS** at edge where applicable |
-| **In transit (inside VPC)** | **TLS** to **RDS Proxy** / **Aurora**; **ElastiCache** **in-transit encryption**; **MSK** **TLS** between clients and brokers |
-| **At rest** | **Aurora** encryption with **AWS KMS** CMK; **S3** **SSE-KMS** (audit exports); **EBS** encrypted volumes for **EC2** matching nodes |
-| **Key policy** | **KMS** CMKs with **least-privilege** key policies; **separate** keys for **PII/audit** vs **operational** if compliance requires |
-
-#### Network-level security (summary)
-
-- **Security groups:** ALB → ECS **only** on app ports; ECS → **only** RDS Proxy / Redis / MSK endpoints; **deny** direct Internet to **data** tiers (§5 VPC).
-- **NACLs:** Optional **extra** subnet boundaries; **SGs** usually sufficient.
-- **PrivateLink / VPC endpoints:** Keep **AWS API** traffic off public Internet (**S3, ECR, Secrets Manager, KMS, CloudWatch**).
-- **AWS WAF + Shield:** Already on **edge** (§5); **rate-based** rules for **abuse** and **credential stuffing**.
-
-#### Audit, tamper evidence, and detection
-
-| Need | Implementation |
-|------|------------------|
-| **Who changed infrastructure** | **AWS CloudTrail** — **organization trail**, **immutable** S3 bucket, **MFA delete** / **Object Lock** on bucket |
-| **Data access audit** | **Aurora** **audit** logs to **CloudWatch Logs** / **S3**; **application** **order_events** (§4.2) for **business** timeline |
-| **Sensitive data in logs** | **Redact** tokens, **PAN**-like fields; **structured** logging with **field classification** |
-| **Threat detection** | **GuardDuty** (optional) for **anomalous** API usage; **VPC Flow Logs** to **S3** for **forensics** (cost vs benefit) |
-
-#### Security in the SDLC
-
-- **Dependency scanning** (CI), **container image** scanning (**ECR**), **IaC** scanning (**Checkov** / **tfsec**).
-- **Penetration testing** and **bug bounty** per **program** policy; **AWS** notification for **simulated** events if required.
+**Network:** **SGs** (ALB→ECS→data only); **VPC endpoints** for AWS APIs; **WAF** rate/geo rules at edge (§5 Edge table).
 
 ---
 
@@ -480,24 +477,7 @@ This section defines the **high availability (HA) design** for the trading data 
 - **Per AZ:** **public subnets** (ALB ENIs, NAT Gateway) + **private subnets** (ECS tasks, matching engine, **ElastiCache**, **MSK** broker ENIs, **Aurora** via managed placement).
 - **Route tables:** Public subnets → **Internet Gateway**; private subnets → **NAT Gateway** (per AZ or shared per cost/HA trade-off) + **VPC endpoints** for AWS APIs.
 
-```mermaid
-flowchart TB
-    subgraph Region["AWS Region — e.g. ap-southeast-1"]
-        subgraph AZ_A["Availability Zone A"]
-            PUB_A[Public subnets — ALB ENI / NAT]
-            PRIV_A[Private subnets — ECS / matching / data clients]
-        end
-        subgraph AZ_B["Availability Zone B"]
-            PUB_B[Public subnets — ALB ENI / NAT]
-            PRIV_B[Private subnets — ECS / matching / data clients]
-        end
-    end
-
-    ALB[Application Load Balancer — spans AZs]
-    ALB --> PUB_A
-    ALB --> PUB_B
-    PRIV_A <--> PRIV_B
-```
+*(Subnet topology is also shown at **data-plane** level in **§2.3**; no second duplicate diagram here.)*
 
 **Multi-AZ placement by component**
 
@@ -590,7 +570,7 @@ Without a **single waterfall**, p99 spikes are **guesswork**.
 | **Alarms** | **CloudWatch Alarm** → **SNS topic** `critical-trading` |
 | **Paging** | **SNS** → **PagerDuty** / **Opsgenie** integration (or **Lambda** → webhook) |
 | **Runbooks** | Link in **alarm description**; **on-call rotation** in PagerDuty |
-| **Dashboards** | **CloudWatch dashboard** + **X-Ray** service map **+** business SLO panel |
+| **Dashboards** | **CloudWatch** + **X-Ray** service map + **business SLO** panel; optional **Amazon Managed Grafana** (§5) for unified ops views |
 
 **Technical-only** “ALB p99” is **insufficient** for **trading** — **composite** pages for **SLO burn rate**.
 
@@ -598,9 +578,58 @@ Without a **single waterfall**, p99 spikes are **guesswork**.
 
 ## 9. Scaling when the product grows
 
-- **Horizontal:** ECS for API/WS; **MSK** partitions; **Aurora** read replicas.
-- **Matching:** **Vertical** first; then **symbol sharding** with **routing** layer.
-- **Global:** DR region, **latency-based** Route 53, **per-region** books (consistency boundaries).
+| Phase | Rough scale | Actions |
+|-------|-------------|---------|
+| **1 — Current** | **~500 req/s** | **ECS** task count + **ALB**; **Aurora** rightsized; **MSK** partitions **≈ symbols**; **Redis** cluster mode if needed |
+| **2 — 10×** | **~5k req/s** | **HPA**/target-tracking on ECS; **Aurora** read replicas + **RDS Proxy** pool tuning; **MSK** add brokers/partitions; **symbol-sharded** matching **routing** |
+| **3 — 100×+** | **50k+ req/s** | **Dedicated** matching on **EC2** (or **EKS** dedicated pools); **DB sharding** / **DynamoDB** for hot paths *only if modeled*; **NLB** for specific paths; **multi-region** active/active *only* with clear **book** boundaries |
+| **Global** | DR / latency | **Route 53** latency/failover; **pilot-light** or **warm** secondary region; **per-region** order books (no silent **global** consistency) |
+
+### 9.1 Monthly cost estimate (~500 req/s, single region)
+
+**Disclaimer:** Figures are **order-of-magnitude** using **US East (N. Virginia)**–style **on-demand** list pricing; **your** bill varies by region, **data transfer**, **storage growth**, **MSK** sizing, and **discounts**. Always model in the **[AWS Pricing Calculator](https://calculator.aws/)**.
+
+**Assumptions for this estimate**
+
+| Assumption | Value used |
+|------------|------------|
+| Hours / month | **730** |
+| Region | **us-east-1** (cheaper than many APAC/EU; use calculator for yours) |
+| Discounts | **None** (no Savings Plans / RIs / Enterprise Discount) |
+| Architecture | **ALB + ECS Fargate** (API), **3× EC2** (matching + etcd, **c7i.large**), **Aurora** cluster **db.r6g.large** (1 writer), **RDS Proxy**, **ElastiCache** **2× cache.r6g.large**, **MSK** **3× kafka.m5.large**, **2× NAT Gateway**, **CloudFront + WAF + Route 53**, moderate logs/traces |
+
+**Rough monthly breakdown (USD)**
+
+| Line item | How estimated | ~ USD/mo |
+|-----------|----------------|----------|
+| **NAT Gateway** | 2 × (~$0.045/h × 730h) + ~$20 **processing** | **~85** |
+| **ALB** | ~$0.0225/h × 730 + ~$25 **LCU** (light) | **~42** |
+| **ECS Fargate** (API) | 4 tasks × 0.5 vCPU, 1 GiB: ~(0.5×$0.0405 + 1×$0.0044)×730×4 | **~73** |
+| **EC2** (matching/etcd) | 3 × **c7i.large** ~$0.0896/h × 730 (on-demand) | **~196** |
+| **Aurora PostgreSQL** | **db.r6g.large** ~$0.29/h × 730 + ~100 GB storage × ~$0.10/GB | **~220** |
+| **RDS Proxy** | Aurora Proxy ~$0.015/vCPU-h × **2** vCPU × 730 (varies) | **~22** |
+| **ElastiCache** | 2 × **cache.r6g.large** ~$0.126/h × 730 | **~184** |
+| **MSK** | 3 × **kafka.m5.large** ~$0.21/h × 730 + **broker storage** (~$0.10/GB-mo × ~300 GB) | **~490** |
+| **CloudFront + WAF + Route 53** | Light traffic + 1 hosted zone + a few WAF rules | **~90** |
+| **CloudWatch + X-Ray** | Metrics, moderate log ingest, sampled traces | **~80** |
+| **Secrets Manager + KMS + Cognito** | Few secrets, keys, modest MAU | **~35** |
+| **S3 + data transfer** | Audit + logs egress buffer | **~40** |
+
+**Indicative total:** **~$1,550 / month** → rounds to **“low thousands” (~$1.5k–$2k)** for this **HA-ish** footprint.
+
+**What moves the number most**
+
+| Driver | Effect |
+|--------|--------|
+| **MSK** (broker class × count × storage) | Often **~25–35%** of total; **smaller brokers** or **MSK Serverless** (where fit) **cuts** hundreds. |
+| **NAT** | **Second NAT** is almost **double** fixed NAT cost; **VPC endpoints** for S3/ECR reduce **NAT** data charges. |
+| **Aurora** | **db.r6g.large** is not tiny; **db.t4g** / **Serverless v2** with low ACU **drops** hundreds (with **trade-offs**). |
+| **Matching on Fargate vs EC2** | Swapping **3× c7i.large** for **Fargate** tasks changes **~$150–250** depending on size. |
+| **Savings Plans / RIs** | Often **~30–40%** off **Fargate/EC2**; **Reserved** for Aurora/ElastiCache if **steady**. |
+
+**Lean dev/staging** (smaller Aurora, **1 NAT**, **smaller MSK** or fewer brokers, no HA Redis): often **~$700–$1,000/mo** before discounts.
+
+**Bottom line:** **“Low thousands USD/month”** here means roughly **~$1.0k–$2.2k/mo** for a **production-shaped** single-region stack with **MSK + Multi-AZ-ish** data tier; **not** a guarantee—**calculate** before committing.
 
 ---
 
@@ -613,7 +642,7 @@ Without a **single waterfall**, p99 spikes are **guesswork**.
 | **p99 < 100 ms** | §6.2 **end-to-end budget**; scoped to **read** vs **write** paths; validated with **k6 + X-Ray** (§8). |
 | **High availability** | §7.1 **Multi-AZ architecture** (VPC, ALB, ECS, Aurora, MSK, ElastiCache, matching quorum); §7.2–7.4 **session**, **partition**, **degraded** modes. |
 
-**Cost:** Fargate + Aurora Serverless v2 or rightsized RDS; **Savings Plans** when stable.
+**Cost:** Indicative **~$1.5k–$2k/mo** on-demand for a **HA-shaped** stack at **500 req/s** (see **§9.1**); **Savings Plans** / **rightsizing** reduce this.
 
 ---
 
@@ -621,12 +650,12 @@ Without a **single waterfall**, p99 spikes are **guesswork**.
 
 | § | Topic |
 |---|--------|
-| §2 | **Architecture overview** (§2.1), control/data planes (§2.2), Multi-AZ (§2.3), read/write (§2.4), service table (§2.5) |
+| §2 | Overview (§2.1), planes (§2.2), Multi-AZ (§2.3), read/write (§2.4), **sequence** (§2.5), service index (§2.6); full tables **§5** |
 | §3 | Matching engine: consistency, persistence, Raft/etcd, RTO |
 | §4 | Idempotency, audit, sequencing, balances |
 | §5 | AWS services **+ Security and identity** (IAM, Cognito, encryption, audit) |
 | §6 | Latency budget |
 | §7 | **HA design: Multi-AZ** (§7.1), WebSocket, split-brain, read-only mode |
 | §8 | Observability: X-Ray, business SLOs, PagerDuty/SNS |
-| §9 | Scaling and multi-region / DR notes |
+| §9 | Scaling, multi-region, **monthly cost estimate (§9.1)** |
 | §10 | Constraint mapping |
