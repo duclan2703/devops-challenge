@@ -30,9 +30,77 @@ Out of scope: full custody, fiat rails, complex margin/derivatives, KYC pipeline
 
 ## 2. Architecture overview — diagrams and planes
 
-The deliverable asks for an **overview of services and roles**. Below: **control vs data plane**, **multi-AZ**, **read vs write paths**, and **sync vs async** — visible at a glance.
+The deliverable asks for an **overview of services and roles**. Start with the **architecture overview** (§2.1), then **control vs data plane** (§2.2), **Multi-AZ** detail (§2.3), **read/write paths** (§2.4), and the **service role** table (§2.5).
 
-### 2.1 Control plane vs data plane
+### 2.1 Architecture overview diagram
+
+Single **regional** view: how **users**, **edge**, **identity & secrets**, **application**, **data**, and **observability** connect. (VPC boundaries, per-AZ placement, and security dashed lines are expanded in §2.3.)
+
+```mermaid
+flowchart TB
+    subgraph Client["Clients"]
+        U[Web / mobile / API clients]
+    end
+
+    subgraph Edge["Edge & load balancing"]
+        R53[Route 53]
+        CF[CloudFront]
+        WAF[WAF + Shield]
+        ALB[ALB + ACM TLS]
+    end
+
+    subgraph Identity["Identity, secrets & encryption"]
+        COG[Cognito OIDC/JWT]
+        SM[Secrets Manager]
+        KMS[KMS CMKs]
+    end
+
+    subgraph App["Application — private subnets, multi-AZ"]
+        ECS[ECS Fargate API + WebSocket]
+        ME[Matching engine + coordination]
+    end
+
+    subgraph Data["Data & messaging"]
+        AUR[(Aurora PostgreSQL)]
+        RED[(ElastiCache Redis)]
+        MSK[[MSK Kafka]]
+        S3[(S3 audit archive)]
+    end
+
+    subgraph Obs["Observability"]
+        CW[CloudWatch]
+        XY[X-Ray / OTel]
+    end
+
+    U --> R53 --> CF --> WAF --> ALB --> ECS --> ME
+    U -.->|sign-in token| COG
+    ECS --> AUR
+    ECS --> RED
+    ME --> AUR
+    ME --> RED
+    ME --> MSK
+    ECS --> MSK
+    ECS -.->|audit / compliance export| S3
+    ECS -.-> SM
+    ME -.-> SM
+    AUR -.-> KMS
+    S3 -.-> KMS
+    ECS -.-> KMS
+    ECS --> CW
+    ECS --> XY
+```
+
+**How to read this diagram**
+
+| Layer | Responsibility |
+|-------|------------------|
+| **Edge** | DNS, **TLS** termination (**ACM**), **WAF** / **Shield**, traffic distribution to **compute**. |
+| **Identity** | **Cognito** issues **JWTs**; **Secrets Manager** holds **DB/MSK** credentials for **IAM**-scoped tasks; **KMS** keys **encrypt** Aurora, S3, and sensitive fields. |
+| **Application** | **Stateless** **ECS** tier + **stateful matching** tier (see **§3** for consistency). |
+| **Data** | **System of record** (**Aurora**), **cache** (**Redis**), **event bus** (**MSK**), **long-term audit** (**S3**). |
+| **Observability** | **Metrics/alarms** and **distributed traces** — full order path in **§8**. |
+
+### 2.2 Control plane vs data plane
 
 | Plane | Responsibility | Typical AWS components |
 |-------|----------------|-------------------------|
@@ -41,7 +109,7 @@ The deliverable asks for an **overview of services and roles**. Below: **control
 
 **Rule:** Trading correctness and latency SLOs apply to the **data plane**. Control-plane outages may block deploys but must not silently corrupt order state.
 
-### 2.2 Diagram A — Multi-AZ data plane (VPC, synchronous vs asynchronous hints)
+### 2.3 Diagram A — Multi-AZ data plane (VPC, synchronous vs asynchronous hints)
 
 ```mermaid
 flowchart LR
@@ -49,31 +117,38 @@ flowchart LR
         Clients[Clients]
     end
 
+    subgraph Identity["Identity & security"]
+        COG[Cognito User Pool OIDC/JWT]
+        KMS[KMS CMKs]
+        SM[Secrets Manager]
+    end
+
     subgraph Edge
         R53[Route 53]
         CF[CloudFront]
         WAF[WAF]
-        ALB[ALB]
+        ALB["ALB + ACM TLS"]
     end
 
     subgraph AZ_A["AZ-a"]
-        ECS_A[ECS API / WS]
+        ECS_A[ECS API / WS IAM task role]
         ME_L[Matching engine LEADER]
-        REDIS_A[ElastiCache replica]
+        REDIS_A[ElastiCache replica TLS]
     end
 
     subgraph AZ_B["AZ-b"]
-        ECS_B[ECS API / WS]
+        ECS_B[ECS API / WS IAM task role]
         ME_S[Matching engine STANDBY]
-        REDIS_B[ElastiCache replica]
+        REDIS_B[ElastiCache replica TLS]
     end
 
     subgraph DataRegion["Regional / multi-AZ data stores"]
-        AUR[(Aurora Primary + replicas)]
-        MSK[[MSK cluster]]
-        S3[(S3 audit / cold)]
+        AUR[(Aurora SSE-KMS)]
+        MSK[[MSK TLS]]
+        S3[(S3 audit SSE-KMS)]
     end
 
+    Clients -.->|sign-in / refresh OIDC| COG
     Clients --> R53 --> CF --> WAF --> ALB
     ALB --> ECS_A
     ALB --> ECS_B
@@ -84,24 +159,32 @@ flowchart LR
     ME_L -.->|hot cache snapshot| REDIS_A
     ME_S -.->|follower / warm| REDIS_B
     MSK -.->|async: market-data consumers| ECS_A
+    ECS_A -.->|DB creds MSK creds| SM
+    ME_L -.->|broker DB secrets| SM
+    AUR -.->|encryption keys| KMS
+    S3 -.->|encryption keys| KMS
+    ECS_A -.->|decrypt data keys| KMS
 ```
 
 **Legend (not all edges are HTTP):**
 
-- **Solid user path:** Client → edge → **ECS** → **matching leader** → **Aurora** (durable commit) and **MSK** (async publish — see §2.3).
-- **Dashed:** Cache replicas; async fan-out. **ElastiCache** holds **working set / snapshots**, not the **source of truth** for recovery (§3).
+- **Solid user path:** Client → edge → **ECS** → **matching leader** → **Aurora** (durable commit) and **MSK** (async publish — see §2.4). **Private APIs** carry **Bearer JWT** issued by **Cognito**; **ECS** validates via **JWKS** (§5).
+- **Dashed — security / support:** **Cognito** = login/token **out of band** of the main request line; **Secrets Manager** = runtime creds for tasks; **KMS** = **SSE-KMS** for Aurora/S3 and **data-key** use; **dashed** cache/async unchanged below.
+- **Dashed — data:** Cache replicas; async fan-out. **ElastiCache** holds **working set / snapshots**, not the **source of truth** for recovery (§3).
 
-### 2.3 Diagram B — Write path vs read path
+### 2.4 Diagram B — Write path vs read path
 
 | Path | Purpose | Synchronous steps (typical) | Async (does not block HTTP ack for ack-eligible APIs) |
 |------|-----------|------------------------------|--------------------------------------------------------|
-| **Write** | Submit / cancel order, **match** | ALB → ECS → **idempotency check (Redis)** → **matching engine** → **append audit + order state to Aurora** → **publish match event to MSK** | Downstream: WebSocket consumers, analytics, **MSK** replication |
-| **Read** | Balances, public book, history | ALB → ECS → **Redis** (ticker, cached book) or **Aurora replica** (history) | — |
+| **Write** | Submit / cancel order, **match** | ALB → ECS → **JWT validate (Cognito JWKS) + scopes** → **idempotency check (Redis)** → **matching engine** → **append audit + order state to Aurora** → **publish match event to MSK** | Downstream: WebSocket consumers, analytics, **MSK** replication |
+| **Read** | Balances, public book, history | ALB → ECS → **JWT** for **private** routes → **Redis** (ticker, cached book) or **Aurora replica** (history) | — |
 
 ```mermaid
 flowchart TB
     subgraph Write["WRITE PATH — latency-sensitive; must be correct"]
-        W1[POST /orders] --> W2[Idempotency Redis]
+        W0["HTTPS + Bearer JWT"] --> Wauth["Validate JWT Cognito JWKS + scopes"]
+        Wauth --> W1[POST /orders]
+        W1 --> W2[Idempotency Redis]
         W2 --> W3[Matching engine leader]
         W3 --> W4["Aurora: WAL-equivalent order + match records"]
         W3 --> W5[MSK produce: MatchEvent with seq]
@@ -109,19 +192,25 @@ flowchart TB
     end
 
     subgraph Read["READ PATH — hot reads (p99 SLO)"]
-        R1[GET /book /ticker] --> R2[Redis snapshot]
-        R3[GET /history] --> R4[Aurora replica]
+        R0["GET + Bearer if private routes"] --> Rauth[Validate JWT when required]
+        Rauth --> R1[GET /book /ticker]
+        Rauth --> R3[GET /history /balances]
+        R1 --> R2[Redis snapshot]
+        R3 --> R4[Aurora replica]
     end
 ```
 
 **MSK publish:** For **HTTP 200** semantics, the design **commits durable state in Aurora first**, then produces to MSK (or uses **outbox pattern** so MSK failure does not lose events — see §3). **p99 < 100 ms** assumes the **synchronous** segment stays within budget (§6).
 
-### 2.4 Diagram C — Where each service sits (role summary)
+### 2.5 Diagram C — Where each service sits (role summary)
 
 | Service | Role in one line |
 |---------|------------------|
-| **Route 53 / CloudFront / WAF / ALB** | DNS, edge cache, L7 security, TLS, route to ECS. |
-| **ECS Fargate** | Stateless API + WebSocket **front**; no order book truth. |
+| **Route 53 / CloudFront / WAF / ALB** | DNS, edge cache, L7 security, **ACM TLS**, route to ECS. |
+| **Cognito User Pool** | **OIDC / JWT** for users; ECS validates **Bearer** tokens (**JWKS**). |
+| **KMS / Secrets Manager** | **SSE-KMS** for Aurora & S3; **Secrets Manager** for DB/MSK creds to tasks (**IAM**-scoped). |
+| **IAM** | **Task roles** for ECS/EC2 — **least privilege** to AWS APIs (**no** static keys in images). |
+| **ECS Fargate** | Stateless API + WebSocket **front**; **JWT validation**; no order book truth. |
 | **Matching engine (EC2 or ECS)** | **Single-writer** per symbol shard; **leader** + **standby**; **Raft/etcd** or external coordination (§3). |
 | **Aurora PostgreSQL** | **System of record**: orders, balances (or reservations), **append-only audit** tables, **outbox** for MSK. |
 | **ElastiCache Redis** | Idempotency keys, **balance reservations**, **hot book snapshot**, rate limits — **not** durable recovery source. |
@@ -271,6 +360,67 @@ Requirements that **generic** web stacks often omit.
 | **CloudWatch** | Metrics, **alarms → SNS** | Native | — |
 | **X-Ray** or **ADOT** | **Distributed traces** (§8) | p99 root cause | Self-hosted Jaeger |
 | **SNS** | Fan-out to **PagerDuty** / email / Lambda | Escalation | EventBridge for complex routing |
+
+### Security and identity
+
+Trading systems require **defense in depth**: network isolation (§5 VPC), **strong identity** for humans and software, **encryption**, and **auditable** access to data and control planes.
+
+#### Identity and access management (IAM)
+
+| Layer | Pattern | AWS services / notes |
+|-------|---------|----------------------|
+| **Workloads → AWS APIs** | **Least privilege** IAM **roles** attached to **ECS task roles** (Fargate) and **EC2 instance profiles** (matching engine, etcd) — **no long-lived access keys** in containers | **IAM**, **STS** for temporary creds; **scoped** policies: e.g. `s3:PutObject` only on `arn:…/audit/*`, `kms:Decrypt` only for specific CMKs |
+| **Humans / operators** | **No shared root**; **SSO** to **roles** with **short sessions** | **IAM Identity Center** (SSO) → **permission sets** → **roles** in accounts; **break-glass** emergency role **MFA**-gated and **CloudTrail**-alerted |
+| **CI/CD and IaC** | **OIDC** from GitHub Actions / CodePipeline to **assume role** — no static keys in repos | **IAM OIDC identity provider** |
+| **Cross-account** (if used) | **Resource policies** + **role assumption** with **external ID** | Document **trust** boundaries |
+
+#### Client-facing identity (API consumers)
+
+| Concern | Approach | Notes |
+|---------|----------|--------|
+| **End users (web/mobile)** | **Amazon Cognito** (User Pools) — **OAuth 2.0 / OIDC**; **JWT access tokens** validated by **ECS** (JWKS) | **Scopes** map to **trading** actions (e.g. `orders:write`, `account:read`); **short-lived** tokens + **refresh** rotation |
+| **Machine / API clients** | **API keys** in **Secrets Manager** or **Cognito** app clients + **client credentials**; **rate limits** at **WAF** + **application** | **Never** log raw secrets; **hash** or **reference by ID** in audit |
+| **Public market data** | **Unauthenticated** or **optional** API key tier | **Separate** paths from **private** order APIs — **WAF** rules per route |
+
+**Authorization:** Enforce **account_id** (or `sub` from token) **matches** resource being traded — **server-side** only; **no** trust of client-supplied account without **cryptographic** binding to identity.
+
+#### Secrets and key management
+
+| Secret type | Store | Practice |
+|-------------|-------|----------|
+| **DB passwords, MSK SASL, third-party API keys** | **AWS Secrets Manager** — **rotation** where supported | ECS tasks **inject** at runtime via **task definition** secrets; **RDS Proxy** can use **Secrets Manager** integration |
+| **Non-secret config** (feature flags, `TRADING_HALTED`) | **Systems Manager Parameter Store** (**Hierarchical** + **SecureString** with **KMS**) | **IAM** restricts **who** can flip trading halt flags (§7.4) |
+| **TLS private keys (if not using ACM)** | **Secrets Manager** or **ACM**-managed certs on **ALB** | Prefer **ACM** for **ALB** public certs |
+
+#### Encryption
+
+| Data state | Mechanism |
+|------------|-----------|
+| **In transit (Internet → ALB)** | **TLS 1.2+**; **modern cipher** policy on **ALB** / **CloudFront**; **HSTS** at edge where applicable |
+| **In transit (inside VPC)** | **TLS** to **RDS Proxy** / **Aurora**; **ElastiCache** **in-transit encryption**; **MSK** **TLS** between clients and brokers |
+| **At rest** | **Aurora** encryption with **AWS KMS** CMK; **S3** **SSE-KMS** (audit exports); **EBS** encrypted volumes for **EC2** matching nodes |
+| **Key policy** | **KMS** CMKs with **least-privilege** key policies; **separate** keys for **PII/audit** vs **operational** if compliance requires |
+
+#### Network-level security (summary)
+
+- **Security groups:** ALB → ECS **only** on app ports; ECS → **only** RDS Proxy / Redis / MSK endpoints; **deny** direct Internet to **data** tiers (§5 VPC).
+- **NACLs:** Optional **extra** subnet boundaries; **SGs** usually sufficient.
+- **PrivateLink / VPC endpoints:** Keep **AWS API** traffic off public Internet (**S3, ECR, Secrets Manager, KMS, CloudWatch**).
+- **AWS WAF + Shield:** Already on **edge** (§5); **rate-based** rules for **abuse** and **credential stuffing**.
+
+#### Audit, tamper evidence, and detection
+
+| Need | Implementation |
+|------|------------------|
+| **Who changed infrastructure** | **AWS CloudTrail** — **organization trail**, **immutable** S3 bucket, **MFA delete** / **Object Lock** on bucket |
+| **Data access audit** | **Aurora** **audit** logs to **CloudWatch Logs** / **S3**; **application** **order_events** (§4.2) for **business** timeline |
+| **Sensitive data in logs** | **Redact** tokens, **PAN**-like fields; **structured** logging with **field classification** |
+| **Threat detection** | **GuardDuty** (optional) for **anomalous** API usage; **VPC Flow Logs** to **S3** for **forensics** (cost vs benefit) |
+
+#### Security in the SDLC
+
+- **Dependency scanning** (CI), **container image** scanning (**ECR**), **IaC** scanning (**Checkov** / **tfsec**).
+- **Penetration testing** and **bug bounty** per **program** policy; **AWS** notification for **simulated** events if required.
 
 ---
 
@@ -458,7 +608,7 @@ Without a **single waterfall**, p99 spikes are **guesswork**.
 
 | Constraint | How the design satisfies it |
 |------------|-----------------------------|
-| **AWS only** | **Route 53, CloudFront, WAF, VPC, ALB, ECS, EC2 (matching/etcd), Aurora, RDS Proxy, ElastiCache, MSK, S3, X-Ray, CloudWatch, SNS, Parameter Store** — data plane as in §2–5. |
+| **AWS only** | **Route 53, CloudFront, WAF, VPC, ALB, ECS, EC2 (matching/etcd), Aurora, RDS Proxy, ElastiCache, MSK, S3, X-Ray, CloudWatch, SNS, Parameter Store** — data plane as in §2–5; **security/identity** as in **§5 (Security and identity)**: **IAM / IAM Identity Center**, **Cognito**, **Secrets Manager**, **KMS**, **ACM**, **CloudTrail**. |
 | **500 RPS** | §6.1 — small ECS footprint with headroom. |
 | **p99 < 100 ms** | §6.2 **end-to-end budget**; scoped to **read** vs **write** paths; validated with **k6 + X-Ray** (§8). |
 | **High availability** | §7.1 **Multi-AZ architecture** (VPC, ALB, ECS, Aurora, MSK, ElastiCache, matching quorum); §7.2–7.4 **session**, **partition**, **degraded** modes. |
@@ -471,9 +621,10 @@ Without a **single waterfall**, p99 spikes are **guesswork**.
 
 | § | Topic |
 |---|--------|
-| §2 | Diagrams: planes, AZ, read/write, service roles |
+| §2 | **Architecture overview** (§2.1), control/data planes (§2.2), Multi-AZ (§2.3), read/write (§2.4), service table (§2.5) |
 | §3 | Matching engine: consistency, persistence, Raft/etcd, RTO |
 | §4 | Idempotency, audit, sequencing, balances |
+| §5 | AWS services **+ Security and identity** (IAM, Cognito, encryption, audit) |
 | §6 | Latency budget |
 | §7 | **HA design: Multi-AZ** (§7.1), WebSocket, split-brain, read-only mode |
 | §8 | Observability: X-Ray, business SLOs, PagerDuty/SNS |
